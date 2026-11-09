@@ -50,6 +50,8 @@
 
 **https://fastly.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/ai-answer-helper.user.js**
 
+CDN 有缓存，新版本可能延迟几小时才同步。要拿最新版就用上面的脚本猫商店地址。
+
 **别用 `raw.githubusercontent.com` 的链接。** 这个域名在国内经常握手失败，我实测本机连不上（TLS 握手直接断开），上面两个地址都可以正常下载。
 
 装好后打开任意网页，右下角会出现一个圆形按钮。
