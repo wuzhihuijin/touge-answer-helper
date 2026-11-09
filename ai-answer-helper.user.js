@@ -4,6 +4,11 @@
 // @version      2.0.1
 // @description  抓取网页题目 → 调用任意 OpenAI 兼容 API 生成答案 → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式；也可导出题目交给任意对话式 AI，再把答案粘回来回填。
 // @license      MIT
+// @tag          头歌
+// @tag          educoder
+// @tag          答题
+// @tag          自动填写
+// @tag          ai
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
