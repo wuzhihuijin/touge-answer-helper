@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         AI 答题助手（通用框架）
+// @name         AI 答题助手（头歌 / 超星 / 通用）
 // @namespace    ai-answer-helper
 // @version      2.0.1
 // @description  抓取网页题目 → 调用任意 OpenAI 兼容 API 生成答案 → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式；也可导出题目交给任意对话式 AI，再把答案粘回来回填。
@@ -12,8 +12,8 @@
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/wuzhihuijin/sgsushsb/main/ai-answer-helper.user.js
-// @downloadURL  https://raw.githubusercontent.com/wuzhihuijin/sgsushsb/main/ai-answer-helper.user.js
+// @updateURL    https://raw.githubusercontent.com/wuzhihuijin/touge-answer-helper/main/ai-answer-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/wuzhihuijin/touge-answer-helper/main/ai-answer-helper.user.js
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==

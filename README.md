@@ -2,7 +2,7 @@
 
 把网页上的题目抓下来，交给任意 OpenAI 兼容的大模型作答，再自动填回页面。
 
-**油猴 / 脚本猫用户脚本** · 平台差异由 adapter 层处理 · **没有 API Key 也能用**
+**头歌（Educoder）/ 超星 / 任意页面通用** · 平台差异由 adapter 层处理 · **没有 API Key 也能用**
 
 ![一键作答：自动识别 8 道题并填好答案](screenshots/answer.png)
 
@@ -44,7 +44,7 @@
 
 然后点这个链接：
 
-**https://raw.githubusercontent.com/wuzhihuijin/sgsushsb/main/ai-answer-helper.user.js**
+**https://raw.githubusercontent.com/wuzhihuijin/touge-answer-helper/main/ai-answer-helper.user.js**
 
 扩展会自动弹出安装页，点「安装」。装好后打开任意网页，右下角会出现一个圆形按钮。
 
