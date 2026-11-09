@@ -42,7 +42,11 @@
 
 先装脚本管理器：[ScriptCat 脚本猫](https://scriptcat.org/) 或 [Tampermonkey](https://www.tampermonkey.net/)。
 
-然后点这个链接：
+**国内用户建议从脚本猫商店装，版本更新会自动提示：**
+
+**https://scriptcat.org/zh-CN/script-show-page/9005**
+
+或者直接点 raw 链接（脚本管理器会自动接管）：
 
 **https://raw.githubusercontent.com/wuzhihuijin/touge-answer-helper/main/ai-answer-helper.user.js**
 
