@@ -15,7 +15,9 @@
 请遵守所在平台的用户协议，成绩与后果自负。
 
 ---
+<img width="660" height="757" alt="image" src="https://github.com/user-attachments/assets/f6c77bc9-8780-48c2-86e9-797a2ceef707" />
 
+觉得有用的话留下一个 Star⭐️ 吧！
 ## ✨ 能做什么
 
 - **一键作答** —— 抓题 → 请求 AI → 自动勾选 / 填写
