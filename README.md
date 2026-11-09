@@ -42,17 +42,19 @@
 
 先装脚本管理器：[ScriptCat 脚本猫](https://scriptcat.org/) 或 [Tampermonkey](https://www.tampermonkey.net/)。
 
-**国内用户建议从脚本猫商店装，版本更新会自动提示：**
+**推荐从脚本猫商店装**，国内访问稳定，有新版会自动提示：
 
 **https://scriptcat.org/zh-CN/script-show-page/9005**
 
-或者直接点 raw 链接（脚本管理器会自动接管）：
+也可以用下面的 CDN 地址（脚本管理器会自动接管并弹出安装页）：
 
-**https://raw.githubusercontent.com/wuzhihuijin/touge-answer-helper/main/ai-answer-helper.user.js**
+**https://fastly.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/ai-answer-helper.user.js**
 
-扩展会自动弹出安装页，点「安装」。装好后打开任意网页，右下角会出现一个圆形按钮。
+**别用 `raw.githubusercontent.com` 的链接。** 这个域名在国内经常握手失败，我实测本机连不上（TLS 握手直接断开），上面两个地址都可以正常下载。
 
-脚本里带了 `@updateURL`，有新版时脚本管理器会自动提示更新，不用手动重装。
+装好后打开任意网页，右下角会出现一个圆形按钮。
+
+脚本的 `@updateURL` 指向脚本猫，有新版时脚本管理器会提示更新，不用手动重装。
 
 ### 方式二：手动粘贴
 
