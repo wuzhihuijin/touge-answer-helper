@@ -36,14 +36,24 @@
 
 ## 📦 安装
 
-### 方式一：脚本猫（推荐）
+### 方式一：一键安装（推荐）
 
-1. 安装 [ScriptCat 脚本猫](https://scriptcat.org/) 或 [Tampermonkey](https://www.tampermonkey.net/)
-2. 打开扩展的「管理面板」→「新建脚本」
-3. 删掉模板内容，把脚本全文粘进去 → **Ctrl+S 保存**
-4. 打开任意网页，右下角会出现一个圆形按钮
+先装脚本管理器：[ScriptCat 脚本猫](https://scriptcat.org/) 或 [Tampermonkey](https://www.tampermonkey.net/)。
 
-### 方式二：直接拖文件
+然后点这个链接：
+
+**https://raw.githubusercontent.com/wuzhihuijin/sgsushsb/main/ai-answer-helper.user.js**
+
+扩展会自动弹出安装页，点「安装」。装好后打开任意网页，右下角会出现一个圆形按钮。
+
+脚本里带了 `@updateURL`，有新版时脚本管理器会自动提示更新，不用手动重装。
+
+### 方式二：手动粘贴
+
+1. 打开扩展的「管理面板」→「新建脚本」
+2. 删掉模板内容，把 `ai-answer-helper.user.js` 全文粘进去 → **Ctrl+S 保存**
+
+### 方式三：拖文件
 
 把 `.user.js` 文件拖进浏览器窗口，扩展会弹出安装页，点「安装」。
 

@@ -12,6 +12,8 @@
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
 // @connect      *
+// @updateURL    https://raw.githubusercontent.com/wuzhihuijin/sgsushsb/main/ai-answer-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/wuzhihuijin/sgsushsb/main/ai-answer-helper.user.js
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
