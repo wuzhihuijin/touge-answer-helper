@@ -1,0 +1,31 @@
+name: release
+
+# 推送形如 v2.0.1 的 tag 时触发：语法检查 + 把 .user.js 挂到 Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 语法检查
+        run: node --check ai-answer-helper.user.js
+
+      - name: 创建 Release 并附上脚本
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" ai-answer-helper.user.js \
+            --title "AI 答题助手 $GITHUB_REF_NAME" \
+            --generate-notes

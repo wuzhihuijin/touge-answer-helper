@@ -1,0 +1,21 @@
+# 系统 / 编辑器
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 本地依赖与构建产物（本项目无需构建，占位防止误提交）
+node_modules/
+dist/
+
+# 本地测试台、草稿与临时截图
+tmp/
+.workbuddy/
+
+# 个人 / 平台专用版本，不随开源版发布
+wbh-helper.user.js
+*.local.js
+.env
+*-答案与解析.md
