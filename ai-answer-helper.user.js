@@ -3,7 +3,7 @@
 // @namespace    ai-answer-helper
 // @version      2.2.3
 // @description  抓取网页题目 → 先查题库接口（兼容 OCS / 言溪题库配置，可填多份）→ 未命中的再调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
-// @icon         https://fastly.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/icon.png
+// @icon         https://gcore.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/icon.png
 // @license      MIT
 // @tag          头歌
 // @tag          educoder
