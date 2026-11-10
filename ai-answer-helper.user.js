@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         AI 答题助手（头歌 / 超星 / 通用）
 // @namespace    ai-answer-helper
-// @version      2.0.2
-// @description  抓取网页题目 → 调用任意 OpenAI 兼容 API 生成答案 → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式；也可导出题目交给任意对话式 AI，再把答案粘回来回填。
+// @version      2.2.0
+// @description  抓取网页题目 → 先查题库接口（兼容 OCS / 言溪题库配置，可填多份）→ 未命中的再调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
 // @license      MIT
 // @tag          头歌
 // @tag          educoder
 // @tag          答题
 // @tag          自动填写
 // @tag          ai
+// @tag          题库
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -51,7 +52,9 @@
     jsonMode: true,
     thinking: false,
     autoHide: true,
-    minQ: 2
+    minQ: 2,
+    bankApi: '',       // 题库接口配置（OCS 那套 JSON，可多份 #### 分隔）
+    bankApiOn: true    // 答题前先查题库接口
   };
   let cfg = Object.assign({}, DEFAULTS, GM_getValue(CFG_KEY, {}) || {});
   const saveCfg = () => GM_setValue(CFG_KEY, cfg);
@@ -215,6 +218,255 @@
       if (i + size < questions.length) await sleep(200);
     }
     return result;
+  }
+
+  /* =========================================================
+   * 3.5 题干归一化（在线题库的多结果比对也用它）
+   * =======================================================*/
+  function toHalfWidth(s) {
+    return String(s)
+      .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .replace(/\u3000/g, ' ');
+  }
+
+  /** 题干归一化：去标签、去题号、去空白与标点、全角转半角、转小写 */
+  function normStem(s) {
+    let t = toHalfWidth(s == null ? '' : s);
+    t = t.replace(/<[^>]*>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ');
+    // 题号：括号型（(1) 【2】 [3]）、「第3题」、「1. / 1、/ 1：」
+    // 注意 1.5 / 0.5 这类小数开头不能当题号切掉，否则「1.5倍」和「2.5倍」会撞车
+    t = t.replace(/^\s*[（(【\[]\s*\d{1,3}\s*[)）】\]]\s*/, '');
+    t = t.replace(/^\s*第\s*\d{1,3}\s*[题小]\s*[.、．:：]?\s*/, '');
+    t = t.replace(/^\s*\d{1,3}\s*(?:[、．:：)）]|\.(?!\d))\s*/, '');
+    t = t.replace(/\s+/g, '');
+    t = t.replace(/[，。、；：？！“”‘’（）【】《》〈〉,.;:?!"'`~!@#$%^&*()\[\]{}<>\-=+|\\\/]/g, '');
+    return t.toLowerCase();
+  }
+
+  /** 答案清洗：去掉「答案：」前缀、解析尾巴、引号；纯字母则压成 ABCD 形式 */
+  function cleanAns(a) {
+    let s = String(a == null ? '' : a).trim();
+    s = s.replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, '');
+    s = s.replace(/^(?:正确)?答案\s*[:：]\s*/, '').replace(/^[选答]\s*[:：]\s*/, '');
+    // 「A 【解析】…」「A 解析：…」这种把解析写在同一行的，只留答案本身
+    s = s.replace(/[（(【\[]\s*(?:解析|分析|考点|难度|来源|出处)[\s\S]*$/, '');
+    s = s.replace(/\s+(?:解析|考点|难度|来源)\s*[:：][\s\S]*$/, '');
+    s = s.trim();
+    const letters = s.replace(/[\s,，、;；\/]+/g, '').toUpperCase();
+    if (/^[A-J]{1,6}$/.test(letters)) return letters;
+    return s.replace(/\s+/g, ' ').trim();
+  }
+
+  function bigrams(s) {
+    const set = new Set();
+    if (s.length === 1) { set.add(s); return set; }
+    for (let i = 0; i < s.length - 1; i++) set.add(s.substr(i, 2));
+    return set;
+  }
+
+  /* =========================================================
+   * 3.6 在线题库（兼容 OCS / 言溪那套「题库配置」JSON）
+   *   一份配置 = 一次 HTTP 请求 + 一段 handler：
+   *     data 里的 ${title} ${options} ${type} 会被替换成题干 / 选项 / 题型，
+   *     handler 用 new Function 解析，接收响应，返回 [题,答] 或 [[题,答],…]。
+   *   多份配置用 #### 隔开，或用数组包多份。
+   * =======================================================*/
+  const API_TIMEOUT = 12000;
+  const API_DEADLINE = 30000;
+  const API_TYPES = {
+    single_choice: 'single', multiple_choice: 'multiple',
+    judgement: 'judgement', fill_blank: 'completion', short_answer: 'completion'
+  };
+  let apiCache = null;     // { raw, list }
+
+  function apiConfigs() {
+    const raw = String(cfg.bankApi || '').trim();
+    if (!raw) return [];
+    if (apiCache && apiCache.raw === raw) return apiCache.list;
+    const list = [];
+    raw.split(/#{3,}/).forEach((seg) => {
+      const t = seg.trim();
+      if (!t) return;
+      let j = null;
+      try { j = JSON.parse(t); } catch (e) {
+        log('⚠️ 在线题库配置有一段不是合法 JSON，已跳过', 'warn');
+        return;
+      }
+      (Array.isArray(j) ? j : [j]).forEach((c) => {
+        if (c && c.url && c.handler) list.push(c);
+      });
+    });
+    apiCache = { raw: raw, list: list };
+    return list;
+  }
+
+  /** 替换 ${title} / ${options} / ${type}；data 里也能写 {handler:"return (env)=>…"} */
+  function apiFill(v, env) {
+    if (typeof v === 'string') {
+      return v.replace(/\$\{(title|type|options)\}/g, (m, k) => (env[k] == null ? '' : String(env[k])));
+    }
+    if (v && typeof v === 'object' && typeof v.handler === 'string') {
+      try {
+        const fn = new Function(v.handler)();
+        const r = typeof fn === 'function' ? fn(env) : fn;
+        return r === undefined ? null : r;
+      } catch (e) {
+        log('⚠️ 在线题库 data 里的 handler 执行出错：' + (e.message || e), 'warn');
+        return null;
+      }
+    }
+    return v;
+  }
+
+  function apiURLEncode(obj) {
+    return Object.keys(obj).map((k) => {
+      const v = obj[k];
+      const s = typeof v === 'string' ? v : JSON.stringify(v);
+      return encodeURIComponent(k) + '=' + encodeURIComponent(s);
+    }).join('&');
+  }
+
+  function apiBuild(c, env) {
+    const data = {};
+    if (c.data && typeof c.data === 'object') {
+      Object.keys(c.data).forEach((k) => {
+        const v = apiFill(c.data[k], env);
+        if (v !== null && v !== undefined) data[k] = v;
+      });
+    }
+    let url = String(apiFill(String(c.url || ''), env));
+    const headers = {};
+    if (c.headers && typeof c.headers === 'object') {
+      Object.keys(c.headers).forEach((k) => { headers[k] = String(apiFill(c.headers[k], env)); });
+    }
+    const method = String(c.method || 'get').toUpperCase();
+    const ctKey = Object.keys(headers).filter((k) => k.toLowerCase() === 'content-type')[0] || '';
+    const isForm = /x-www-form-urlencoded/i.test(ctKey ? headers[ctKey] : '');
+    let body = null;
+
+    if (method === 'GET') {
+      const qs = apiURLEncode(data);
+      if (qs) url += (url.indexOf('?') >= 0 ? '&' : '?') + qs;
+    } else if (isForm) {
+      body = apiURLEncode(data);
+      headers[ctKey] = 'application/x-www-form-urlencoded';
+    } else {
+      if (!ctKey) headers['Content-Type'] = 'application/json';
+      body = JSON.stringify(data);
+    }
+    return { url: url, method: method, headers: headers, body: body };
+  }
+
+  function apiSend(req) {
+    return new Promise((resolve, reject) => {
+      const done = (fn, v) => { try { clearTimeout(timer); } catch (e) {} fn(v); };
+      const timer = setTimeout(() => done(reject, new Error('请求超时')), API_TIMEOUT);
+      try {
+        GM_xmlhttpRequest({
+          url: req.url, method: req.method, headers: req.headers, data: req.body, timeout: API_TIMEOUT,
+          onload: (r) => {
+            if (r.status >= 200 && r.status < 300) done(resolve, r.responseText);
+            else done(reject, new Error('HTTP ' + r.status));
+          },
+          onerror: () => done(reject, new Error('请求失败，可能域名没放行（@connect）或被浏览器拦了')),
+          ontimeout: () => done(reject, new Error('请求超时'))
+        });
+      } catch (e) { done(reject, e); }
+    });
+  }
+
+  /** handler 返回可能是 [题,答]、[[题,答],…]、或直接一段文本 */
+  function apiPairs(out) {
+    if (out == null) return [];
+    if (typeof out === 'string') return [[null, out]];
+    if (!Array.isArray(out)) return [];
+    if (out.length === 2 && (out[0] == null || typeof out[0] === 'string')
+      && (out[1] == null || typeof out[1] === 'string')) {
+      return [[out[0], out[1]]];
+    }
+    return out.filter((x) => Array.isArray(x) && x.length >= 2).map((x) => [x[0], x[1]]);
+  }
+
+  /** 多结果时挑和题干最像的那条 */
+  function apiPick(pairs, title) {
+    if (!pairs.length) return null;
+    if (pairs.length === 1) {
+      const a = pairs[0][1];
+      return a == null || String(a).trim() === '' ? null : String(a).trim();
+    }
+    const t = normStem(title);
+    const tb = bigrams(t);
+    let best = null, bestS = -1;
+    pairs.forEach((p) => {
+      const a = p[1];
+      if (a == null || String(a).trim() === '') return;
+      const qk = p[0] == null ? t : normStem(String(p[0]));
+      let s;
+      if (!qk) s = 0.5;
+      else if (qk === t) s = 1;
+      else if (qk.indexOf(t) >= 0 || t.indexOf(qk) >= 0) s = 0.9;
+      else {
+        const kb = bigrams(qk);
+        let inter = 0;
+        tb.forEach((g) => { if (kb.has(g)) inter++; });
+        s = (2 * inter) / (tb.size + kb.size || 1);
+      }
+      if (s > bestS) { bestS = s; best = String(a).trim(); }
+    });
+    return bestS >= 0.6 ? best : null;
+  }
+
+  function apiEnv(q) {
+    return {
+      title: q.title || '',
+      type: API_TYPES[q.type] || 'single',
+      options: (q.choices || []).map((c, i) => LETTERS[i] + '. ' + c.t).join('\n')
+    };
+  }
+
+  async function apiAsk(q) {
+    const list = apiConfigs();
+    if (!list.length) return null;
+    const env = apiEnv(q);
+    for (let i = 0; i < list.length; i++) {
+      const c = list[i];
+      const nm = c.name || c.url;
+      try {
+        const text = await apiSend(apiBuild(c, env));
+        let res = text;
+        if ((c.contentType || 'json') !== 'text') {
+          try { res = JSON.parse(text); } catch (e) { throw new Error('返回的不是 JSON'); }
+        }
+        let fn = null;
+        try { fn = new Function(String(c.handler))(); } catch (e) {
+          throw new Error('handler 无法解析（页面 CSP 可能禁了 new Function）：' + (e.message || e));
+        }
+        const raw = apiPick(apiPairs(typeof fn === 'function' ? fn(res) : fn), q.title);
+        if (raw) return { ans: cleanAns(raw), from: nm };
+      } catch (e) {
+        log('⚠️ 在线题库「' + nm + '」没取到答案：' + (e.message || e), 'warn');
+      }
+    }
+    return null;
+  }
+
+  /** 并发查，最多 4 路，整体不超过 30 秒 */
+  async function apiAskAll(qs, onHit) {
+    const out = {};
+    if (!qs.length || !apiConfigs().length) return out;
+    const queue = qs.slice();
+    const deadline = Date.now() + API_DEADLINE;
+    const c = { stop: false };
+    const worker = async () => {
+      while (queue.length && !c.stop) {
+        if (Date.now() > deadline) { c.stop = true; return; }
+        const q = queue.shift();
+        const r = await apiAsk(q);
+        if (r) { out[q.n] = r.ans; if (onHit) onHit(q, r); }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, qs.length) }, worker));
+    return out;
   }
 
   /* =========================================================
@@ -579,12 +831,39 @@
     if (!ad) throw new Error('当前页面没识别出题目（可在设置里调低「最少题数」，或改用「导出题目」）');
     const qs = await ad.collect();
     if (!qs.length) throw new Error('抓到 0 道题');
-    setStat('共 ' + qs.length + ' 题，请求 AI…');
     log('识别为：' + ad.name + '，共 ' + qs.length + ' 题');
-    const map = await askAI(qs, setStat);
-    setStat('AI 已返回，正在填入…');
+
+    // 1) 题库接口（OCS 配置）先搜一遍
+    const map = {};
+    let rest = qs;
+    if (cfg.bankApiOn !== false && apiConfigs().length) {
+      setStat('共 ' + qs.length + ' 题，查题库接口…');
+      const apiHit = [];
+      const apiMap = await apiAskAll(qs, (q) => apiHit.push(q.n));
+      if (apiHit.length) {
+        apiHit.forEach((n) => { map[n] = apiMap[n]; });
+        log('🌐 题库命中 ' + apiHit.length + ' 题：' + apiHit.join(','));
+      }
+      rest = qs.filter((q) => !apiMap[q.n]);
+      if (!rest.length) log('✅ 全部命中题库，本轮未调用 AI');
+    }
+
+    // 2) 还没命中的才请求 AI
+    let aiErr = null;
+    if (rest.length) {
+      setStat('题库命中 ' + (qs.length - rest.length) + ' 题，AI 作答 ' + rest.length + ' 题…');
+      try {
+        const aiMap = await askAI(rest, setStat);
+        Object.assign(map, aiMap);
+      } catch (e) { aiErr = e; }
+    }
+    if (aiErr && !Object.keys(map).length) throw aiErr;
+
+    // 3) 回填
+    setStat('正在填入…');
     const r = await ad.apply(qs, map);
-    setStat('已填 ' + r.ok + '/' + qs.length + ' 题');
+    if (aiErr) log('⚠️ AI 出错（题库部分已填）：' + (aiErr.message || aiErr), 'warn');
+    setStat('已填 ' + r.ok + '/' + qs.length + ' 题' + (aiErr ? '，部分题缺答案' : ''));
     log('✅ 已填 ' + r.ok + '/' + qs.length + ' 题' + (r.miss.length ? '，缺答案：' + r.miss.join(',') : ''));
     return r;
   }
@@ -699,7 +978,7 @@
       '<div class="row"><button class="main" id="aah-run">一键作答</button></div>' +
       '<div class="row"><button class="ghost" id="aah-exp">导出题目</button><button class="ghost" id="aah-imp">导入答案</button></div>' +
       '<div class="row"><button class="ghost" id="aah-detect">重新检测</button><button class="ghost" id="aah-submit" style="display:none">提交</button></div>' +
-      '<div class="row"><button class="ghost" id="aah-cfg">设置</button></div>' +
+      '<div class="row"><button class="ghost" id="aah-bank">题库</button><button class="ghost" id="aah-cfg">设置</button></div>' +
       '<div class="log" id="aah-log"></div>' +
       '<div class="cap">只负责填答案；「提交 / 交卷」请自行确认。</div>' +
       '</div>';
@@ -714,6 +993,7 @@
     $('#aah-imp', box).onclick = openImport;
     $('#aah-detect', box).onclick = async () => { setStat('重新检测…'); await pickAdapter(true); setStat(current ? '已识别：' + current.name : '没识别出题目'); };
     $('#aah-submit', box).onclick = () => run('submit');
+    $('#aah-bank', box).onclick = openBank;
     $('#aah-cfg', box).onclick = openSettings;
 
     makeDraggable(box, $('.hd', box));
@@ -795,6 +1075,83 @@
     setTimeout(() => { const t = $('#aah-imp-t'); if (t) t.focus(); }, 50);
   }
 
+  /* ---------- 题库接口（OCS 配置） ---------- */
+  function openBank() {
+    const m = showModal('题库接口',
+      '<div style="font-size:11.5px;color:#8b949e;line-height:1.7;margin-bottom:8px">' +
+        '把 <b>OCS / 言溪那套题库配置</b> 整个粘进来即可（就是 <code>[{"url":…,"handler":…}]</code> 那段 JSON）。' +
+        '多份配置用 <code>####</code> 隔开。<br>' +
+        '可用占位符：<code>${title}</code> 题干、<code>${options}</code> 选项（<code>A. xxx\\nB. xxx</code> 换行拼接）、<code>${type}</code> 题型（single / multiple / judgement / completion）。<br>' +
+        '顺序：<b>题库接口 → AI</b>，接口答不出来的才调 AI。</div>' +
+      '<textarea id="aah-bk-api" spellcheck="false" placeholder=\'[{"name":"我的题库","url":"https://example.com/search","method":"post","contentType":"json","headers":{"Content-Type":"application/json"},"data":{"question":"${title}","options":"${options}","type":"${type}"},"handler":"return (res)=> res.code === 200 ? [res.question,res.answer] : undefined"}]\'' +
+        ' style="width:100%;height:190px;font:12px/1.5 Consolas,monospace;padding:8px;border:1px solid #d0d7de;border-radius:8px"></textarea>' +
+      '<label style="margin-top:10px"><input id="aah-bk-apion" type="checkbox" style="width:auto;margin-right:6px">启用题库接口（关了就直接用 AI）</label>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-top:10px">' +
+        '<button id="aah-bk-apisave" style="padding:5px 12px;border:1px solid #d0d7de;background:#f6f8fa;border-radius:7px;cursor:pointer;font-size:12px">保存</button>' +
+        '<button id="aah-bk-apitest" style="padding:5px 12px;border:1px solid #d0d7de;background:#f6f8fa;border-radius:7px;cursor:pointer;font-size:12px">测试一下</button>' +
+        '<button id="aah-bk-apiclear" style="padding:5px 12px;border:1px solid #d0d7de;background:#f6f8fa;border-radius:7px;cursor:pointer;font-size:12px">清空</button>' +
+      '</div>' +
+      '<div id="aah-bk-apimsg" style="margin-top:8px;font-size:12px;color:#57606a;min-height:17px;word-break:break-all"></div>',
+      [{ t: '关闭', f: closeModal }]);
+
+    const ta = $('#aah-bk-api', m);
+    const on = $('#aah-bk-apion', m);
+    const msg = (t, isErr) => {
+      const el = $('#aah-bk-apimsg', m);
+      if (!el) return;
+      el.style.color = isErr ? '#cf222e' : '#1a7f37';
+      el.textContent = t;
+    };
+    if (ta) ta.value = cfg.bankApi || '';
+    if (on) on.checked = cfg.bankApiOn !== false;
+
+    const save = () => {
+      cfg.bankApi = ta ? ta.value.trim() : '';
+      cfg.bankApiOn = on ? !!on.checked : true;
+      apiCache = null;
+      saveCfg();
+      return apiConfigs();
+    };
+
+    const saveBtn = $('#aah-bk-apisave', m);
+    if (saveBtn) saveBtn.onclick = () => {
+      const l = save();
+      if (!cfg.bankApi) { msg('已清空，之后只用 AI', false); return; }
+      if (!l.length) { msg('存下了，但没解析出有效题库：每份都必须有 url 和 handler', true); return; }
+      msg('✅ 已保存 ' + l.length + ' 份配置' + (cfg.bankApiOn ? '' : '（但没勾启用）'), false);
+    };
+
+    const clearBtn = $('#aah-bk-apiclear', m);
+    if (clearBtn) clearBtn.onclick = () => {
+      if (ta) ta.value = '';
+      apiCache = null;
+      cfg.bankApi = '';
+      saveCfg();
+      msg('已清空题库配置', false);
+    };
+
+    const testBtn = $('#aah-bk-apitest', m);
+    if (testBtn) testBtn.onclick = async () => {
+      const l = save();
+      if (!l.length) { msg('先粘一份有效配置，至少要有 url 和 handler', true); return; }
+      msg('测试中，最多等 12 秒…', false);
+      let q = {
+        n: 1, title: 'OSI 参考模型共分为几层', type: 'single_choice',
+        choices: [{ t: '5' }, { t: '6' }, { t: '7' }, { t: '8' }]
+      };
+      try {
+        if (current) {
+          const qs2 = await current.collect();
+          if (qs2 && qs2.length) q = qs2[0];
+        }
+      } catch (e) { /* 页面上没题就用示例题 */ }
+      const t0 = Date.now();
+      const r = await apiAsk(q);
+      if (r) msg('✅ ' + r.from + ' → ' + r.ans + '（' + (Date.now() - t0) + 'ms）', false);
+      else msg('❌ 没拿到答案：题库里没有、handler 返回空，或请求被跨域拦截（详情看面板日志）', true);
+    };
+  }
+
   function openSettings() {
     const p = PRESETS[cfg.provider] || PRESETS.deepseek;
     const opts = Object.keys(PRESETS).map((k) =>
@@ -807,6 +1164,7 @@
       '<label>每次打包题数（6-12 较稳）</label><input id="aah-chunk" type="number" min="1" max="20" value="' + esc(cfg.chunk) + '">' +
       '<label>通用模式最少识别题数</label><input id="aah-minq" type="number" min="1" max="10" value="' + esc(cfg.minQ) + '">' +
       '<label><input id="aah-think" type="checkbox" style="width:auto;margin-right:6px"' + (cfg.thinking ? ' checked' : '') + '>思考模式（部分模型支持，计算题更准但更贵）</label>' +
+      '<label><input id="aah-apion" type="checkbox" style="width:auto;margin-right:6px"' + (cfg.bankApiOn !== false ? ' checked' : '') + '>答题前先查题库接口（命中就不调 AI）</label>' +
       '<div id="aah-test" style="margin-top:12px;font-size:12px;color:#57606a;min-height:17px;word-break:break-all"></div>' +
       '<div style="font-size:11.5px;color:#8b949e;margin-top:6px">Key 只存在本机脚本存储里，除你填的 AI 接口外不会发往任何地方。</div>',
       [
@@ -819,6 +1177,7 @@
             cfg.chunk = Math.max(1, Math.min(20, parseInt($('#aah-chunk').value, 10) || 8));
             cfg.minQ = Math.max(1, Math.min(10, parseInt($('#aah-minq').value, 10) || 2));
             cfg.thinking = !!$('#aah-think').checked;
+            cfg.bankApiOn = !!$('#aah-apion').checked;
             saveCfg();
             log('设置已保存');
             return true;
@@ -915,6 +1274,7 @@
   }
 
   GM_registerMenuCommand('⚙️ 答题助手设置', openSettings);
+  GM_registerMenuCommand('🌐 题库接口配置', openBank);
   GM_registerMenuCommand('🔍 重新检测页面', async () => { await pickAdapter(true); setStat(current ? '已识别：' + current.name : '没识别出题目'); });
 
   boot();
