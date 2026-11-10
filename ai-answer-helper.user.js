@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 答题助手（头歌 / 超星 / 通用）
 // @namespace    ai-answer-helper
-// @version      2.2.0
+// @version      2.2.1
 // @description  抓取网页题目 → 先查题库接口（兼容 OCS / 言溪题库配置，可填多份）→ 未命中的再调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
 // @license      MIT
 // @tag          头歌
@@ -378,12 +378,12 @@
   /** handler 返回可能是 [题,答]、[[题,答],…]、或直接一段文本 */
   function apiPairs(out) {
     if (out == null) return [];
-    if (typeof out === 'string') return [[null, out]];
+    if (typeof out === 'string' || typeof out === 'number') return [[null, out]];
     if (!Array.isArray(out)) return [];
-    if (out.length === 2 && (out[0] == null || typeof out[0] === 'string')
-      && (out[1] == null || typeof out[1] === 'string')) {
-      return [[out[0], out[1]]];
-    }
+    // 单条 [题, 答]：答案可能是数字（填空题「7」）或布尔，不能只认字符串
+    const scalar = (x) => x == null || typeof x === 'string'
+      || typeof x === 'number' || typeof x === 'boolean';
+    if (out.length === 2 && scalar(out[0]) && scalar(out[1])) return [[out[0], out[1]]];
     return out.filter((x) => Array.isArray(x) && x.length >= 2).map((x) => [x[0], x[1]]);
   }
 
@@ -424,15 +424,16 @@
     };
   }
 
-  async function apiAsk(q) {
+  async function apiAsk(q, deadline) {
     const list = apiConfigs();
     if (!list.length) return null;
     const env = apiEnv(q);
     for (let i = 0; i < list.length; i++) {
+      if (deadline && Date.now() > deadline) return null;   // 整体超时，别再逐份硬等
       const c = list[i];
       const nm = c.name || c.url;
       try {
-        const text = await apiSend(apiBuild(c, env));
+        const text = String(await apiSend(apiBuild(c, env))).replace(/^\uFEFF/, '');
         let res = text;
         if ((c.contentType || 'json') !== 'text') {
           try { res = JSON.parse(text); } catch (e) { throw new Error('返回的不是 JSON'); }
@@ -440,6 +441,10 @@
         let fn = null;
         try { fn = new Function(String(c.handler))(); } catch (e) {
           throw new Error('handler 无法解析（页面 CSP 可能禁了 new Function）：' + (e.message || e));
+        }
+        // 兼容「直接写箭头函数没加 return」的配置
+        if (fn === undefined) {
+          try { fn = new Function('return (' + String(c.handler) + ')')(); } catch (e) { /* 忽略 */ }
         }
         const raw = apiPick(apiPairs(typeof fn === 'function' ? fn(res) : fn), q.title);
         if (raw) return { ans: cleanAns(raw), from: nm };
@@ -461,7 +466,7 @@
       while (queue.length && !c.stop) {
         if (Date.now() > deadline) { c.stop = true; return; }
         const q = queue.shift();
-        const r = await apiAsk(q);
+        const r = await apiAsk(q, deadline);
         if (r) { out[q.n] = r.ans; if (onHit) onHit(q, r); }
       }
     };
