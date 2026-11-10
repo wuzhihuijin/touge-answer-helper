@@ -1,3 +1,5 @@
+<img src="icon-256.png" width="96" align="right" alt="AI 答题助手图标" />
+
 # 头歌学习通AI 答题助手
 
 把网页上的题目抓下来，交给任意 OpenAI 兼容的大模型作答，再自动填回页面。
@@ -51,11 +53,16 @@
 
 也可以用下面的 CDN 地址（脚本管理器会自动接管并弹出安装页）：
 
-**https://fastly.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/ai-answer-helper.user.js**
+**https://gcore.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/ai-answer-helper.user.js**
 
 CDN 有缓存，新版本可能延迟几小时才同步。要拿最新版就用上面的脚本猫商店地址。
 
-**别用 `raw.githubusercontent.com` 的链接。** 这个域名在国内经常握手失败，我实测本机连不上（TLS 握手直接断开），上面两个地址都可以正常下载。
+**别用 `raw.githubusercontent.com` 的链接。** 这个域名在国内经常握手失败，我实测本机连不上（TLS 握手直接断开）。
+
+jsDelivr 的节点在国内时好时坏，主地址打不开就换这两个（实测都能正常下载）：
+
+- `https://testingcf.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/ai-answer-helper.user.js`
+- `https://fastly.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/ai-answer-helper.user.js`
 
 装好后打开任意网页，右下角会出现一个圆形按钮。
 
@@ -78,9 +85,9 @@ CDN 有缓存，新版本可能延迟几小时才同步。要拿最新版就用�
 
 点右下角圆点展开面板 → **设置**。
 
-![设置面板：服务商、Base URL、模型名、API Key、打包题数](screenshots/settings.png)
+![设置面板：服务商、Base URL、模型名、API Key、打包题数、识别题数、思考模式、题库接口开关](screenshots/settings.png)
 
-### 六个字段
+### 八个字段
 
 - **服务商预设** —— 选一家；换别家选「自定义」
 - **Base URL** —— 见下一节，**结尾不要带 `/chat/completions`**
@@ -88,6 +95,8 @@ CDN 有缓存，新版本可能延迟几小时才同步。要拿最新版就用�
 - **API Key** —— 本地 Ollama 可以留空
 - **每次打包题数** —— 默认 8；题目长、计算多时调到 5~6 更稳
 - **通用模式最少识别题数** —— 默认 2，防止把点赞按钮当成题目
+- **思考模式** —— 勾上让模型先推理再作答，计算题更准，但更慢也更贵（不是所有模型都支持）
+- **答题前先查题库接口** —— 默认勾选；取消后所有题直接走 AI，不再请求题库
 
 填完先点 **测试连接**，出现「✅ 连通成功」再保存。
 
