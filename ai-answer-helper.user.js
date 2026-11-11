@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 答题助手（头歌 / 超星 / 通用）
 // @namespace    ai-answer-helper
-// @version      2.2.5
+// @version      2.2.6
 // @description  抓取网页题目 → 先查题库接口（兼容 OCS / 言溪题库配置，可填多份）→ 未命中的再调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
 // @icon         https://gcore.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/icon-256.png
 // @license      MIT
@@ -570,46 +570,63 @@
    * -------------------------------------------------------*/
   const cxAdapter = {
     id: 'cx-api',
-    name: '超星类 · 试卷接口',
+    name: '作业试卷接口（整卷）',
     _paper: null,
 
     _ctx() {
       const m = location.pathname.match(/^(.*?)\/exercise\/(\d+)(?:\/users\/([^/?#]+))?/);
-      if (!m) return null;
-      return { prefix: m[1] || '', id: m[2], user: m[3] || '' };
+      if (m) return { prefix: m[1] || '', id: m[2], user: m[3] || '', query: '' };
+      // URL 里没有 /exercise/{id}（SPA 路由、考试页套壳、被包在别的路径下）时，
+      // 从页面已经发出的真实请求里反查 —— 比猜路径可靠，还能白捡 vpn/login 参数
+      if (this._res) return this._res;
+      let urls = [];
+      try { urls = performance.getEntriesByType('resource').map((e) => e.name); } catch (e) { /* 老浏览器 */ }
+      for (let i = urls.length - 1; i >= 0; i--) {
+        const mm = urls[i].match(/^(.*?)\/api\/exercises\/(\d+)\/start\.json(\?[^#]*)?/);
+        if (mm) {
+          this._res = { prefix: mm[1] || '', id: mm[2], user: '', query: mm[3] || '' };
+          return this._res;
+        }
+      }
+      return null;
     },
 
-    _q() {
+    _q(c) {
+      c = c || this._ctx();
+      if (c && c.query) return c.query; // 反查来的请求本身已带 token
       const qs = [];
       const all = [location.search, location.href]
         .concat(performance.getEntriesByType('resource').map((e) => e.name)).join(' ');
       const vpn = all.match(/vpn-\d+-[\d.]+/);
       if (vpn) qs.push(vpn[0]); // WebVPN 网关的裸参数名
-      const login = this._ctx() && this._ctx().user;
-      if (login) qs.push('login=' + encodeURIComponent(login), 'zzud=' + encodeURIComponent(login));
+      if (c && c.user) qs.push('login=' + encodeURIComponent(c.user), 'zzud=' + encodeURIComponent(c.user));
       return qs.length ? '?' + qs.join('&') : '';
     },
 
     _url(path) {
       const c = this._ctx();
-      return c.prefix + path + this._q();
+      return c.prefix + path + this._q(c);
     },
 
     async detect() {
       const c = this._ctx();
-      if (!c) return false;
+      if (!c) { this._why = '页面地址和网络请求里都没找到 /api/exercises/{id}/start.json'; return false; }
       try {
         const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 4000);
+        const timer = setTimeout(() => ctrl.abort(), 10000);
         const r = await fetch(this._url('/api/exercises/' + c.id + '/start.json'), {
           credentials: 'include', signal: ctrl.signal
         });
         clearTimeout(timer);
-        if (!r.ok) return false;
+        if (!r.ok) { this._why = '拉试卷 HTTP ' + r.status + '（' + c.id + '）'; return false; }
         const j = await r.json();
         if (j && Array.isArray(j.exercise_question_types)) { this._paper = j; return true; }
+        this._why = '接口返回里没有 exercise_question_types';
         return false;
-      } catch (e) { return false; }
+      } catch (e) {
+        this._why = e.name === 'AbortError' ? '拉试卷超时（10s）' : ('拉试卷失败：' + e.message);
+        return false;
+      }
     },
 
     async collect() {
@@ -813,16 +830,19 @@
     if (current && !force) return current;
     current = null;
     setDot('…');
+    const why = [];
     for (const a of ADAPTERS) {
       try {
         if (await a.detect()) { current = a; break; }
-      } catch (e) { /* 下一个 */ }
+        if (a._why) { why.push(a.name + '：' + a._why); a._why = ''; }
+      } catch (e) { why.push(a.name + '：' + e.message); }
     }
     setDot(current ? '●' : '·');
     if (box) {
       const el = $('#aah-adapter', box);
       if (el) el.textContent = current ? current.name : '未识别';
     }
+    if (!current && why.length) log('没接管的原因 → ' + why.join(' ｜ '), 'warn');
     return current;
   }
 
