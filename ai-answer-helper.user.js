@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI 答题助手（头歌 / 超星 / 通用）
 // @namespace    ai-answer-helper
-// @version      2.2.6
-// @description  抓取网页题目 → 先查题库接口（兼容 OCS / 言溪题库配置，可填多份）→ 未命中的再调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
+// @version      2.2.8
+// @description  抓取网页题目 → 先查本地题库（导入 Word / 文本，文件不上传）→ 再查在线题库接口（兼容 OCS / 言溪配置，可填多份）→ 都未命中的才调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
 // @icon         https://gcore.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/icon-256.png
 // @license      MIT
 // @tag          头歌
@@ -55,7 +55,8 @@
     autoHide: true,
     minQ: 2,
     bankApi: '',       // 题库接口配置（OCS 那套 JSON，可多份 #### 分隔）
-    bankApiOn: true    // 答题前先查题库接口
+    bankApiOn: true,   // 答题前先查题库接口
+    bankLocalOn: true  // 答题前先查本地题库（Word / 文本导入的）
   };
   let cfg = Object.assign({}, DEFAULTS, GM_getValue(CFG_KEY, {}) || {});
   const saveCfg = () => GM_setValue(CFG_KEY, cfg);
@@ -246,7 +247,7 @@
 
   /** 答案清洗：去掉「答案：」前缀、解析尾巴、引号；纯字母则压成 ABCD 形式 */
   function cleanAns(a) {
-    let s = String(a == null ? '' : a).trim();
+    let s = toHalfWidth(String(a == null ? '' : a)).trim();
     s = s.replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, '');
     s = s.replace(/^(?:正确)?答案\s*[:：]\s*/, '').replace(/^[选答]\s*[:：]\s*/, '');
     // 「A 【解析】…」「A 解析：…」这种把解析写在同一行的，只留答案本身
@@ -476,6 +477,270 @@
   }
 
   /* =========================================================
+   * 3.7 本地题库（Word .docx / txt / md，本地解析，文件不上传）
+   *   docx 本质是个 zip：用 DecompressionStream 取出 word/document.xml，
+   *   按段落还原成文本行，再按「题号 / 选项 / 答案：」的排版切题。
+   *   存 GM 存储，答题时用 normStem + 二元组相似度匹配，和在线题库共用一套。
+   * =======================================================*/
+  const BANK_KEY = 'aah_bank_v1';               // { v: 版本戳, name: 来源文件, list: [[题干, 答案], …] }
+  const BANK_MAX_BYTES = 4.5 * 1024 * 1024;     // 粗略上限，超了浏览器存储会失败
+  let bankCache = null;
+
+  const QNO_RE = /^\s*(?:\d{1,4}\s*[.、．)）](?!\d)|[（(]\s*\d{1,4}\s*[)）]|第\s*\d{1,4}\s*题)/;
+  const OPT_RE = /^\s*[A-Ja-j]\s*[.、．)）:：]\s*\S/;
+  const ANS_RE = /^\s*(?:参考|正确|标准|我的)?答案\s*[】\]]?\s*[:：]\s*(.*)$/;
+  const ANS_BRK = /^\s*【\s*答案\s*】\s*[:：]?\s*(.*)$/;
+  const SEC_RE = /^\s*(?:[一二三四五六七八九十]{1,3}\s*[、.．]|第\s*[一二三四五六七八九十]{1,3}\s*[部分章节])/;
+
+  /** docx（zip）→ word/document.xml 文本 */
+  async function docxXml(buf) {
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error('这个浏览器不支持解压 docx（需要 Chrome / Edge 103+）。' +
+        '可以先用 Word「另存为」纯文本再导入');
+    }
+    const b = buf instanceof ArrayBuffer ? buf : await new Response(buf).arrayBuffer();
+    const dv = new DataView(b);
+    const n = dv.byteLength;
+    const dec = (bytes) => {
+      try { return new TextDecoder('utf-8').decode(bytes); } catch (e) { return ''; }
+    };
+    // ① 从尾部找 ZIP 中央目录结尾（EOCD）
+    let eocd = -1;
+    for (let i = n - 22; i >= Math.max(0, n - 66000); i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('这不是有效的 docx（找不到 ZIP 目录），文件可能损坏或带密码');
+    const cnt = dv.getUint16(eocd + 10, true);
+    let p = dv.getUint32(eocd + 16, true);
+    if (cnt === 0xffff || p === 0xffffffff) {
+      throw new Error('这个 docx 用了 ZIP64（通常是体积超大），暂不支持；另存为 txt 再导入');
+    }
+    // ② 遍历中央目录，找 word/document.xml
+    let hit = null;
+    for (let k = 0; k < cnt && p + 46 <= n; k++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) break;
+      const method = dv.getUint16(p + 10, true);
+      const csize = dv.getUint32(p + 20, true);
+      const nlen = dv.getUint16(p + 28, true);
+      const elen = dv.getUint16(p + 30, true);
+      const clen = dv.getUint16(p + 32, true);
+      const lho = dv.getUint32(p + 42, true);
+      if (dec(new Uint8Array(b, p + 46, nlen)) === 'word/document.xml') {
+        hit = { method: method, csize: csize, lho: lho };
+        break;
+      }
+      p += 46 + nlen + elen + clen;
+    }
+    if (!hit) throw new Error('docx 里没有 word/document.xml，可能不是 Word 文档');
+    // ③ 读本地文件头算出正文起点
+    const lnlen = dv.getUint16(hit.lho + 26, true);
+    const lelen = dv.getUint16(hit.lho + 28, true);
+    const start = hit.lho + 30 + lnlen + lelen;
+    const data = new Uint8Array(b, start, Math.min(hit.csize || 0, n - start));
+    if (hit.method === 0) return dec(data);
+    if (hit.method !== 8) throw new Error('docx 用了不认识的压缩方式（method=' + hit.method + '）');
+    const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return dec(new Uint8Array(await new Response(stream).arrayBuffer()));
+  }
+
+  /** docx 的 XML → 文本行（按 w:p 段落拆，保留 w:br 换行） */
+  function docxLines(xml) {
+    let doc = null;
+    try { doc = new DOMParser().parseFromString(String(xml), 'application/xml'); } catch (e) { doc = null; }
+    const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+    const ps = doc ? doc.getElementsByTagNameNS(W, 'p') : null;
+    if (!ps || !ps.length) {
+      return String(xml).replace(/<[^>]*>/g, '\n').split(/\n+/)
+        .map((s) => s.replace(/\u00a0/g, ' ').trim()).filter(Boolean);
+    }
+    const walk = (node, acc) => {
+      for (let i = 0; i < node.childNodes.length; i++) {
+        const c = node.childNodes[i];
+        if (c.nodeType !== 1) continue;
+        const tag = c.localName || c.nodeName;
+        if (tag === 't') acc.push(c.textContent);
+        else if (tag === 'tab') acc.push('\t');
+        else if (tag === 'br' || tag === 'cr') acc.push('\n');
+        else if (tag === 'instrText' || tag === 'delText') continue;
+        else walk(c, acc);
+      }
+    };
+    const out = [];
+    for (let i = 0; i < ps.length; i++) {
+      const acc = [];
+      walk(ps[i], acc);
+      String(acc.join('')).split('\n').forEach((l) => {
+        const t = l.replace(/\u00a0/g, ' ').trim();
+        if (t) out.push(t);
+      });
+    }
+    return out;
+  }
+
+  /**
+   * 文本行 → [[题干, 答案], …]
+   * 支持：①「1. 题干 / A. xx / 答案：C」 ②表格（题干、答案各一段）
+   *      ③「1. 题干 答案：C」同一行  ④【答案】C / 正确答案：C
+   */
+  function parseBankText(input) {
+    const lines = Array.isArray(input) ? input : String(input == null ? '' : input).split(/\r?\n/);
+    const pairs = [];
+    let cur = '';
+    const add = (q, a) => {
+      const qq = String(q == null ? '' : q).replace(/\s+/g, ' ').trim();
+      const aa = cleanAns(a);
+      if (qq.length >= 2 && aa) pairs.push([qq, aa]);
+    };
+    const push = (s) => {
+      if (!s) return;
+      if (!cur) { cur = s; return; }
+      // 中文直接接上，西文补空格，避免「what is」拼成「whatis」
+      cur += (/[\u4e00-\u9fa5]$/.test(cur) || /^[\u4e00-\u9fa5]/.test(s)) ? s : ' ' + s;
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = String(lines[i] == null ? '' : lines[i]).replace(/\u00a0/g, ' ').trim();
+      if (!line) continue;
+      // ① 答案行
+      const am = line.match(ANS_RE) || line.match(ANS_BRK);
+      if (am) {
+        const a = cleanAns(am[1]);
+        if (cur && a) add(cur, a);
+        cur = '';
+        continue;
+      }
+      // ② 选项行不进题干
+      if (OPT_RE.test(line)) continue;
+      // ③ 章节标题、页眉页脚、表格表头
+      if (SEC_RE.test(line)) { cur = ''; continue; }
+      if (/^\s*(?:第\s*\d+\s*页|共\s*\d+\s*页|得分|分值|总分|卷面)/.test(line)) continue;
+      if (/^(?:序号|题号|编号|题目|题干|问题|答案|参考答案|正确答案|标准答案|选项|答案选项|题型|分值|难度|得分)$/.test(line)) continue;
+      // ④ 题号行 → 开新题
+      if (QNO_RE.test(line)) {
+        const rest = line.replace(QNO_RE, '').trim();
+        cur = '';
+        const im = rest.match(/(?:参考|正确|标准)?答案\s*[:：]\s*(.+)$/);
+        if (im) { add(rest.slice(0, im.index), im[1]); continue; }
+        push(rest);
+        continue;
+      }
+      // ⑤ 表格排版：题干后单独一段是纯答案
+      if (cur && /^(?:[A-J]{1,6}|正确|错误|对|错|√|×|是|否|T|F)$/i.test(line)) {
+        add(cur, line);
+        cur = '';
+        continue;
+      }
+      if (!cur && /^\d{1,4}$/.test(line)) continue;   // 表格里的「序号」列
+      // ⑥ 其余都算上一题的续行
+      push(line);
+    }
+    return pairs;
+  }
+
+  function bankData() {
+    const d = GM_getValue(BANK_KEY, null);
+    if (d && Array.isArray(d.list)) return d;
+    return { v: 0, name: '', list: [] };
+  }
+
+  function bankSave(list, name) {
+    const d = { v: Date.now(), name: name || '', list: list };
+    let s = '';
+    try { s = JSON.stringify(d); } catch (e) { throw new Error('题库内容无法保存'); }
+    let bytes = s.length * 2;
+    try { bytes = new Blob([s]).size; } catch (e) { /* 老环境按字符估 */ }
+    if (bytes > BANK_MAX_BYTES) {
+      throw new Error('题库太大（约 ' + (bytes / 1048576).toFixed(1) + ' MB），超出浏览器存储上限，请拆成多个文件分批导入');
+    }
+    GM_setValue(BANK_KEY, d);
+    bankCache = null;
+  }
+
+  function bankIndex() {
+    const d = bankData();
+    if (bankCache && bankCache.v === d.v) return bankCache;
+    const map = new Map();
+    const arr = [];
+    d.list.forEach((it) => {
+      const q = Array.isArray(it) ? it[0] : (it && it.q);
+      const a = Array.isArray(it) ? it[1] : (it && it.a);
+      const k = normStem(q);
+      if (!k || a == null || String(a).trim() === '' || map.has(k)) return;
+      map.set(k, String(a));
+      arr.push({ k: k, a: String(a), len: k.length });
+    });
+    bankCache = { v: d.v, map: map, arr: arr, name: d.name || '' };
+    return bankCache;
+  }
+
+  /** 在本地题库里找答案，返回 { ans, s } 或 null */
+  function bankFind(title) {
+    const idx = bankIndex();
+    if (!idx.arr.length) return null;
+    const t = normStem(title);
+    if (!t) return null;
+    if (idx.map.has(t)) return { ans: idx.map.get(t), s: 1 };
+    const tb = bigrams(t);
+    let best = null, bestS = 0;
+    const win = Math.max(4, Math.round(t.length * 0.4));
+    for (let i = 0; i < idx.arr.length; i++) {
+      const e = idx.arr[i];
+      if (Math.abs(e.len - t.length) > win) continue;
+      let s;
+      if (e.k.indexOf(t) >= 0 || t.indexOf(e.k) >= 0) {
+        const short = Math.min(e.len, t.length), long = Math.max(e.len, t.length);
+        s = long && short / long >= 0.55 ? 0.9 : 0;
+      } else {
+        const kb = bigrams(e.k);
+        let inter = 0;
+        tb.forEach((g) => { if (kb.has(g)) inter++; });
+        s = (2 * inter) / ((tb.size + kb.size) || 1);
+      }
+      if (s > bestS) { bestS = s; best = e; }
+    }
+    return best && bestS >= 0.75 ? { ans: best.a, s: bestS } : null;
+  }
+
+  /** 合并导入：同题干覆盖答案，其余追加 */
+  function bankMerge(pairs, name) {
+    const d = bankData();
+    const old = new Map();
+    d.list.forEach((it) => { if (Array.isArray(it)) old.set(normStem(it[0]), it); });
+    let add = 0, upd = 0;
+    pairs.forEach((pr) => {
+      const k = normStem(pr[0]);
+      if (!k) return;
+      if (old.has(k)) {
+        const it = old.get(k);
+        if (String(it[1]) !== String(pr[1])) { it[1] = pr[1]; upd++; }
+      } else { old.set(k, [pr[0], pr[1]]); add++; }
+    });
+    const list = Array.from(old.values());
+    bankSave(list, name);
+    return { add: add, upd: upd, total: list.length };
+  }
+
+  async function bankImportFile(file) {
+    const nm = String(file.name || '文件');
+    const low = nm.toLowerCase();
+    let lines;
+    if (/\.docx$/.test(low)) {
+      lines = docxLines(await docxXml(await file.arrayBuffer()));
+    } else if (/\.doc$/.test(low)) {
+      throw new Error('老版 .doc 读不了：请在 Word 里「另存为」→ 选「Word 文档(*.docx)」再导入');
+    } else if (/\.(txt|md|csv|text)$/.test(low) || low.indexOf('.') < 0) {
+      lines = String(await file.text()).split(/\r?\n/);
+    } else {
+      throw new Error('只支持 .docx / .txt / .md，这个文件是「' + nm.split('.').pop() + '」');
+    }
+    const pairs = parseBankText(lines);
+    if (!pairs.length) {
+      throw new Error('没从「' + nm + '」里解析出题目：请确认每道题后面跟着一行「答案：X」' +
+        '（答案：/ 正确答案：/ 【答案】 都认）');
+    }
+    return bankMerge(pairs, nm);
+  }
+
+  /* =========================================================
    * 4. Adapter 注册表
    * 每个 adapter 需要：
    *   id / name
@@ -573,22 +838,54 @@
     name: '作业试卷接口（整卷）',
     _paper: null,
 
-    _ctx() {
-      const m = location.pathname.match(/^(.*?)\/exercise\/(\d+)(?:\/users\/([^/?#]+))?/);
-      if (m) return { prefix: m[1] || '', id: m[2], user: m[3] || '', query: '' };
-      // URL 里没有 /exercise/{id}（SPA 路由、考试页套壳、被包在别的路径下）时，
-      // 从页面已经发出的真实请求里反查 —— 比猜路径可靠，还能白捡 vpn/login 参数
-      if (this._res) return this._res;
+    /**
+     * 所有可能的整卷接口地址，页面自己发过的排前面。
+     * 关键是「哪个能用得试过才知道」——WebVPN 之类网关的接口对参数极敏感，
+     * 少一个 coursesId 就返回登录页 HTML（HTTP 照样 200），拼是拼不出来的。
+     */
+    _cands() {
+      if (this._candList) return this._candList;
+      const out = []; const seen = new Set();
+      const push = (o) => { if (o.url && !seen.has(o.url)) { seen.add(o.url); out.push(o); } };
       let urls = [];
       try { urls = performance.getEntriesByType('resource').map((e) => e.name); } catch (e) { /* 老浏览器 */ }
-      for (let i = urls.length - 1; i >= 0; i--) {
-        const mm = urls[i].match(/^(.*?)\/api\/exercises\/(\d+)\/start\.json(\?[^#]*)?/);
-        if (mm) {
-          this._res = { prefix: mm[1] || '', id: mm[2], user: '', query: mm[3] || '' };
-          return this._res;
-        }
+      // 页面调过的试卷类接口：/api/exercises/{id}/xxx.json（个别版本带 /v2/ 这类前缀）
+      const RE = /^(.*?)\/api\/(?:v\d+\/)?exercises\/(\d+)\/([^?#]*\.json)(\?[^#]*)?/;
+      const hits = [];
+      urls.forEach((u) => {
+        const mm = String(u).match(RE);
+        if (mm) hits.push({ url: u, prefix: mm[1] || '', id: mm[2], tail: mm[3], query: mm[4] || '' });
+      });
+      // ① 页面自己请求过 start.json：原样复用，token / coursesId 一个不差
+      hits.forEach((h) => {
+        if (h.tail !== 'start.json') return;
+        push({ url: h.url, prefix: h.prefix, id: h.id, user: '', query: h.query, real: true });
+      });
+      // ② 只调过同组的别的接口（get_exercise_user_info 之类）：拿它的前缀和参数改写
+      //    这一条很关键——有些版本根本不请求 start.json，但参数规格是同一套
+      hits.forEach((h) => {
+        if (h.tail === 'start.json') return;
+        const b = { prefix: h.prefix, id: h.id, user: '', query: h.query, real: false };
+        b.url = b.prefix + '/api/exercises/' + b.id + '/start.json' + h.query;
+        push(b);
+      });
+      // ③ 实在没记录：从地址里解析，自己拼参数，最后兜底
+      const m = location.pathname.match(/^(.*?)\/exercise\/(\d+)(?:\/users\/([^/?#]+))?/);
+      if (m) {
+        const b = { prefix: m[1] || '', id: m[2], user: m[3] || '', query: '', real: false };
+        b.url = b.prefix + '/api/exercises/' + b.id + '/start.json' + this._q(b);
+        push(b);
       }
-      return null;
+      this._candList = out;
+      return out;
+    },
+
+    _ctx(reset) {
+      if (reset) { this._res = null; this._win = null; this._candList = null; }
+      if (this._res) return this._res;
+      const list = this._cands();
+      this._res = list[0] || null;
+      return this._res;
     },
 
     _q(c) {
@@ -603,40 +900,97 @@
       return qs.length ? '?' + qs.join('&') : '';
     },
 
+    /** 已经试出来的那条可用地址；还没试出来时退回第一候选 */
+    _base() {
+      return this._win || this._ctx();
+    },
+
     _url(path) {
-      const c = this._ctx();
-      return c.prefix + path + this._q(c);
+      const c = this._base();
+      if (!c) return null;
+      return c.prefix + path + (c.query || this._q(c));
+    },
+
+    /** 试一条地址：返回试卷对象，失败返回 null 并把原因记到 _errs */
+    async _tryOne(c, errs) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      let r, txt;
+      try {
+        r = await fetch(c.url, {
+          credentials: 'include',
+          headers: { Accept: 'application/json, text/plain, */*' },
+          signal: ctrl.signal
+        });
+        txt = await r.text();
+      } catch (e) {
+        clearTimeout(timer);
+        errs.push(e.name === 'AbortError' ? '超时(12s)' : ('网络失败 ' + e.message));
+        return null;
+      }
+      clearTimeout(timer);
+      if (!r.ok) { errs.push('HTTP ' + r.status); return null; }
+      let j = null;
+      try { j = JSON.parse(txt.replace(/^\uFEFF/, '')); } catch (e) { /* 下面记原因 */ }
+      if (!j) {
+        const ct = r.headers.get('content-type') || '无 content-type';
+        const head = txt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+        errs.push('不是 JSON（' + ct + '）：' + (head || '空响应'));
+        return null;
+      }
+      if (!Array.isArray(j.exercise_question_types)) { errs.push('缺 exercise_question_types'); return null; }
+      return j;
+    },
+
+    /**
+     * 拉整卷：候选地址挨个试，第一个能给出合法试卷的就是它。
+     * 这样网关少参数返回登录页、CDN 回旧页之类的情况都能自动绕过。
+     */
+    async _loadPaper(report) {
+      const list = this._cands();
+      if (!list.length) {
+        if (report) this._why = '页面地址和网络记录里都没有 /api/exercises/{id}/start.json 的痕迹';
+        return null;
+      }
+      const errs = [];
+      for (const c of list) {
+        const j = await this._tryOne(c, errs);
+        if (j) { this._win = c; this._paper = j; return j; }
+      }
+      if (report) {
+        this._why = '试了 ' + list.length + ' 条地址都不行 → ' + errs.slice(0, 2).join(' / ');
+      }
+      return null;
     },
 
     async detect() {
-      const c = this._ctx();
-      if (!c) { this._why = '页面地址和网络请求里都没找到 /api/exercises/{id}/start.json'; return false; }
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 10000);
-        const r = await fetch(this._url('/api/exercises/' + c.id + '/start.json'), {
-          credentials: 'include', signal: ctrl.signal
-        });
-        clearTimeout(timer);
-        if (!r.ok) { this._why = '拉试卷 HTTP ' + r.status + '（' + c.id + '）'; return false; }
-        const j = await r.json();
-        if (j && Array.isArray(j.exercise_question_types)) { this._paper = j; return true; }
-        this._why = '接口返回里没有 exercise_question_types';
+      this._ctx(true); // 每次重新扫一遍网络记录
+      const list = this._cands();
+      if (!list.length) {
+        this._why = '页面地址和网络记录里都没有 /api/exercises/{id}/start.json 的痕迹';
         return false;
+      }
+      // SPA 在同一个文档里换卷子（考试 → 考试、作业 → 考试）时，缓存的旧卷必须丢掉
+      if (this._pid !== list[0].id) {
+        this._pid = list[0].id;
+        this._paper = null;
+        this._win = null;
+      }
+      try {
+        return !!(await this._loadPaper(true));
       } catch (e) {
-        this._why = e.name === 'AbortError' ? '拉试卷超时（10s）' : ('拉试卷失败：' + e.message);
+        this._why = '拉试卷失败：' + e.message;
         return false;
       }
     },
 
     async collect() {
-      const c = this._ctx();
       let data = this._paper;
-      if (!data) {
-        const r = await fetch(this._url('/api/exercises/' + c.id + '/start.json'), { credentials: 'include' });
-        data = await r.json();
-        this._paper = data;
-      }
+      const cur = this._base();
+      // 卷子 id 对不上就重拉，别把上一份卷子的题当成这一份
+      if (data && cur && data.exercise && String(data.exercise.id) !== String(cur.id)) data = null;
+      if (!data) data = await this._loadPaper(false);
+      if (!data) throw new Error('拉整卷接口失败，看日志里的「没接管的原因」');
       const out = [];
       (data.exercise_question_types || []).forEach((g) => {
         (g.items || []).forEach((it) => {
@@ -859,22 +1213,35 @@
     if (!qs.length) throw new Error('抓到 0 道题');
     log('识别为：' + ad.name + '，共 ' + qs.length + ' 题');
 
-    // 1) 题库接口（OCS 配置）先搜一遍
+    // 1) 本地题库（Word / 文本导入的，纯本地查表，不耗时）
     const map = {};
     let rest = qs;
-    if (cfg.bankApiOn !== false && apiConfigs().length) {
-      setStat('共 ' + qs.length + ' 题，查题库接口…');
-      const apiHit = [];
-      const apiMap = await apiAskAll(qs, (q) => apiHit.push(q.n));
-      if (apiHit.length) {
-        apiHit.forEach((n) => { map[n] = apiMap[n]; });
-        log('🌐 题库命中 ' + apiHit.length + ' 题：' + apiHit.join(','));
-      }
-      rest = qs.filter((q) => !apiMap[q.n]);
-      if (!rest.length) log('✅ 全部命中题库，本轮未调用 AI');
+    if (cfg.bankLocalOn !== false && bankIndex().arr.length) {
+      setStat('共 ' + qs.length + ' 题，查本地题库…');
+      const locHit = [];
+      qs.forEach((q) => {
+        const r = bankFind(q.title);
+        if (r) { map[q.n] = r.ans; locHit.push(q.n); }
+      });
+      if (locHit.length) log('📄 本地题库命中 ' + locHit.length + ' 题：' + locHit.join(','));
+      rest = qs.filter((q) => !map[q.n]);
+      if (!rest.length) log('✅ 全部命中本地题库，本轮未调用 AI');
     }
 
-    // 2) 还没命中的才请求 AI
+    // 2) 在线题库接口（OCS 配置）
+    if (rest.length && cfg.bankApiOn !== false && apiConfigs().length) {
+      setStat('还剩 ' + rest.length + ' 题，查在线题库接口…');
+      const apiHit = [];
+      const apiMap = await apiAskAll(rest, (q) => apiHit.push(q.n));
+      if (apiHit.length) {
+        apiHit.forEach((n) => { map[n] = apiMap[n]; });
+        log('🌐 在线题库命中 ' + apiHit.length + ' 题：' + apiHit.join(','));
+      }
+      rest = rest.filter((q) => !apiMap[q.n]);
+      if (!rest.length) log('✅ 剩下的全部命中在线题库，本轮未调用 AI');
+    }
+
+    // 3) 还没命中的才请求 AI
     let aiErr = null;
     if (rest.length) {
       setStat('题库命中 ' + (qs.length - rest.length) + ' 题，AI 作答 ' + rest.length + ' 题…');
@@ -885,7 +1252,7 @@
     }
     if (aiErr && !Object.keys(map).length) throw aiErr;
 
-    // 3) 回填
+    // 4) 回填
     setStat('正在填入…');
     const r = await ad.apply(qs, map);
     if (aiErr) log('⚠️ AI 出错（题库部分已填）：' + (aiErr.message || aiErr), 'warn');
@@ -1103,12 +1470,31 @@
 
   /* ---------- 题库接口（OCS 配置） ---------- */
   function openBank() {
-    const m = showModal('题库接口',
+    const bk = bankIndex();
+    const bkInfo = bk.arr.length
+      ? '已导入 <b>' + bk.arr.length + '</b> 题' + (bk.name ? '（' + esc(bk.name) + '）' : '')
+      : '还没有本地题库';
+    const m = showModal('题库',
+      '<div style="font-size:12.5px;font-weight:600;margin-bottom:4px">📄 本地题库（Word / 文本）</div>' +
+      '<div style="font-size:11.5px;color:#8b949e;line-height:1.7;margin-bottom:8px">' +
+        '选一个 <code>.docx</code> / <code>.txt</code> / <code>.md</code> 文件，在本地解析后存进浏览器 —— <b>文件不会上传</b>。<br>' +
+        '排版要求：每道题后面跟一行 <code>答案：C</code>（<code>正确答案：</code>、<code>【答案】C</code> 也认）。' +
+        '重复导入是<b>合并</b>：同题干的答案会被新文件覆盖，其余保留。</div>' +
+      '<div id="aah-bk-locinfo" style="font-size:12px;color:#1a7f37;margin-bottom:8px">' + bkInfo + '</div>' +
+      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+        '<button id="aah-bk-pick" style="padding:5px 12px;border:1px solid #d0d7de;background:#f6f8fa;border-radius:7px;cursor:pointer;font-size:12px">选择文件导入</button>' +
+        '<button id="aah-bk-locdel" style="padding:5px 12px;border:1px solid #d0d7de;background:#f6f8fa;border-radius:7px;cursor:pointer;font-size:12px">清空本地题库</button>' +
+        '<input id="aah-bk-file" type="file" accept=".docx,.txt,.md" style="display:none">' +
+      '</div>' +
+      '<label style="margin-top:10px"><input id="aah-bk-locon" type="checkbox" style="width:auto;margin-right:6px"' + (cfg.bankLocalOn !== false ? ' checked' : '') + '>答题前先查本地题库</label>' +
+      '<div id="aah-bk-locmsg" style="margin-top:6px;font-size:12px;color:#57606a;min-height:17px;word-break:break-all"></div>' +
+      '<hr style="border:0;border-top:1px solid #eaeef2;margin:14px 0">' +
+      '<div style="font-size:12.5px;font-weight:600;margin-bottom:4px">🌐 在线题库接口（可选）</div>' +
       '<div style="font-size:11.5px;color:#8b949e;line-height:1.7;margin-bottom:8px">' +
         '把 <b>OCS / 言溪那套题库配置</b> 整个粘进来即可（就是 <code>[{"url":…,"handler":…}]</code> 那段 JSON）。' +
         '多份配置用 <code>####</code> 隔开。<br>' +
         '可用占位符：<code>${title}</code> 题干、<code>${options}</code> 选项（<code>A. xxx\\nB. xxx</code> 换行拼接）、<code>${type}</code> 题型（single / multiple / judgement / completion）。<br>' +
-        '顺序：<b>题库接口 → AI</b>，接口答不出来的才调 AI。</div>' +
+        '顺序：<b>本地题库 → 在线接口 → AI</b>，前面命中的题不会再去问 AI。</div>' +
       '<textarea id="aah-bk-api" spellcheck="false" placeholder=\'[{"name":"我的题库","url":"https://example.com/search","method":"post","contentType":"json","headers":{"Content-Type":"application/json"},"data":{"question":"${title}","options":"${options}","type":"${type}"},"handler":"return (res)=> res.code === 200 ? [res.question,res.answer] : undefined"}]\'' +
         ' style="width:100%;height:190px;font:12px/1.5 Consolas,monospace;padding:8px;border:1px solid #d0d7de;border-radius:8px"></textarea>' +
       '<label style="margin-top:10px"><input id="aah-bk-apion" type="checkbox" style="width:auto;margin-right:6px">启用题库接口（关了就直接用 AI）</label>' +
@@ -1130,6 +1516,58 @@
     };
     if (ta) ta.value = cfg.bankApi || '';
     if (on) on.checked = cfg.bankApiOn !== false;
+
+    /* ---- 本地题库（Word / 文本） ---- */
+    const locInfo = $('#aah-bk-locinfo', m);
+    const locMsgEl = $('#aah-bk-locmsg', m);
+    const locMsg = (t, isErr) => {
+      if (!locMsgEl) return;
+      locMsgEl.style.color = isErr ? '#cf222e' : '#1a7f37';
+      locMsgEl.textContent = t;
+    };
+    const locOn = $('#aah-bk-locon', m);
+    if (locOn) locOn.onchange = () => { cfg.bankLocalOn = !!locOn.checked; saveCfg(); };
+
+    const fileEl = $('#aah-bk-file', m);
+    const pickBtn = $('#aah-bk-pick', m);
+    if (pickBtn && fileEl) pickBtn.onclick = () => fileEl.click();
+    if (fileEl) fileEl.onchange = async () => {
+      const f = fileEl.files && fileEl.files[0];
+      if (!f) return;
+      locMsg('读取并解析中：' + f.name + '（' + Math.round(f.size / 1024) + ' KB）…', false);
+      if (pickBtn) pickBtn.disabled = true;
+      try {
+        const r = await bankImportFile(f);
+        const bk2 = bankIndex();
+        if (locInfo) locInfo.innerHTML = '已导入 <b>' + bk2.arr.length + '</b> 题（' + esc(f.name) + '）';
+        locMsg('✅ 新增 ' + r.add + ' 题、更新 ' + r.upd + ' 题，题库共 ' + r.total + ' 题', false);
+        log('📄 本地题库导入完成：共 ' + r.total + ' 题（新增 ' + r.add + '，更新 ' + r.upd + '）');
+        // 顺手拿当前页面第 1 题试搜一下，让用户当场看见命不命中
+        if (current) {
+          try {
+            const qs0 = await current.collect();
+            if (qs0 && qs0.length) {
+              const hit = bankFind(qs0[0].title);
+              locMsg('✅ 共 ' + r.total + ' 题 ｜ 拿当前第 1 题试搜：' +
+                (hit ? '命中 → ' + hit.ans : '没命中（说明这份卷子不在这份题库里，或题干差异太大）'), false);
+            }
+          } catch (e) { /* 试搜失败不影响导入结果 */ }
+        }
+      } catch (e) {
+        locMsg('❌ ' + (e.message || e), true);
+        log('❌ 本地题库导入失败：' + (e.message || e), 'err');
+      } finally {
+        if (pickBtn) pickBtn.disabled = false;
+        fileEl.value = '';
+      }
+    };
+    const delBtn = $('#aah-bk-locdel', m);
+    if (delBtn) delBtn.onclick = () => {
+      bankSave([], '');
+      if (locInfo) locInfo.textContent = '还没有本地题库';
+      locMsg('已清空本地题库', false);
+      log('本地题库已清空');
+    };
 
     const save = () => {
       cfg.bankApi = ta ? ta.value.trim() : '';
@@ -1300,7 +1738,7 @@
   }
 
   GM_registerMenuCommand('⚙️ 答题助手设置', openSettings);
-  GM_registerMenuCommand('🌐 题库接口配置', openBank);
+  GM_registerMenuCommand('📚 题库配置（本地 Word / 在线接口）', openBank);
   GM_registerMenuCommand('🔍 重新检测页面', async () => { await pickAdapter(true); setStat(current ? '已识别：' + current.name : '没识别出题目'); });
 
   boot();
