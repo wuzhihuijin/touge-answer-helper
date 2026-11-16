@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 答题助手（头歌 / 超星 / 通用）
 // @namespace    ai-answer-helper
-// @version      2.2.8
+// @version      2.3.0
 // @description  抓取网页题目 → 先查本地题库（导入 Word / 文本，文件不上传）→ 再查在线题库接口（兼容 OCS / 言溪配置，可填多份）→ 都未命中的才调任意 OpenAI 兼容 API → 自动填入。平台差异由 adapter 层适配，内置头歌/超星类，其余页面走通用启发式。
 // @icon         https://gcore.jsdelivr.net/gh/wuzhihuijin/touge-answer-helper@main/icon-256.png
 // @license      MIT
@@ -120,9 +120,10 @@
     '1) 单选题、判断题：只输出一个选项字母，例如 A；',
     '2) 多选题：输出多个字母，按字母升序、英文逗号分隔，例如 A,C；',
     '3) 填空题：只输出应填入的文字，不要解释、不要加引号和句号；一题多个空用 | 分隔，顺序与空一致；',
-    '4) 严格输出 JSON 对象，key 是题号（字符串），value 是答案字符串；',
-    '5) 不要输出任何 JSON 以外的文字，不要使用 markdown 代码块；',
-    '6) 计算题认真算，宁可多算一遍也不要给含糊答案。'
+    '4) 简答题、论述题：直接给出完整的参考答案正文，可分点陈述；论述题按题目要求写足字数，不要写「见教材」；',
+    '5) 严格输出 JSON 对象，key 是题号（字符串），value 是答案字符串；',
+    '6) 不要输出任何 JSON 以外的文字，不要使用 markdown 代码块；',
+    '7) 计算题认真算，宁可多算一遍也不要给含糊答案。'
   ].join('\n');
 
   async function chat(messages, override) {
@@ -189,8 +190,10 @@
       lines.push('[' + q.n + ']（' + t + '）' + q.title);
       if (q.choices && q.choices.length) {
         q.choices.forEach((c, i) => lines.push('   ' + LETTERS[i] + '. ' + c.t));
+      } else if (q.type === 'short_answer') {
+        lines.push('   （简答 / 论述题，给出完整的参考答案正文，可分点，不要只给关键词）');
       } else {
-        lines.push('   （填空题，直接给出应填的文字）');
+        lines.push('   （填空题，给出应填的文字；多个空用 | 分隔）');
       }
     });
     return '请给出下面 ' + list.length + ' 道题的答案，只输出 JSON 对象。\n\n' + lines.join('\n');
@@ -1041,7 +1044,206 @@
   ADAPTERS.push(cxAdapter);
 
   /* ---------------------------------------------------------
-   * 4.3 通用启发式：没有专属 adapter 时兜底
+   * 4.3 超星 / 学习通 作业作答页（直接读页面 DOM 后回填）
+   *     典型地址：mooc1-api.chaoxing.com/mooc-ans/mooc2/work/dowork
+   *     题目容器 .questionLi，选项 .answerBg（data 属性里存字母），
+   *     填空 / 简答是 UEditor，必须调页面里的 UE 实例才写得进去
+   * -------------------------------------------------------*/
+  const CX_TYPES = {
+    '单选题': 'single_choice', '多选题': 'multiple_choice', '判断题': 'judgement',
+    '填空题': 'fill_blank', '简答题': 'short_answer', '论述题': 'short_answer',
+    '名词解释': 'short_answer', '计算题': 'short_answer', '分析题': 'short_answer',
+    '其他': 'short_answer'
+  };
+
+  /** 往 UEditor 里写内容；拿不到实例就退回去直接改它那个 iframe 的 body */
+  function cxWrite(ta, text) {
+    const id = ta.id || ta.name;
+    const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+    const html = '<p>' + String(text)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br/>') + '</p>';
+    let ed = null;
+    try { ed = W.UE && W.UE.getEditor ? W.UE.getEditor(id) : null; } catch (e) { /* 页面没挂 UE */ }
+    if (!ed) {
+      try {
+        const inst = (W.UE && W.UE.instants) || {};
+        for (const k in inst) {
+          if (k === id || k.indexOf(id) >= 0 || id.indexOf(k) >= 0) { ed = inst[k]; break; }
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+    if (ed && ed.setContent) {
+      ed.setContent(html);
+      try { ed.sync && ed.sync(); } catch (e) { /* 忽略 */ }
+      return true;
+    }
+    // 兜底：UEditor 的可编辑区在 iframe 里
+    let box = ta.parentElement;
+    for (let i = 0; i < 5 && box; i++) {
+      const f = box.querySelector('iframe');
+      if (f && f.contentDocument && f.contentDocument.body) {
+        f.contentDocument.body.innerHTML = html;
+        ta.value = String(text);
+        return true;
+      }
+      box = box.parentElement;
+    }
+    return false;
+  }
+
+  const cxWorkAdapter = {
+    id: 'cx-work',
+    name: '学习通作业（页面直填）',
+    _lis: null,
+
+    /** 题目可能落在同源 iframe 里（老版 doHomeWorkNew 就是），两处都找 */
+    _findList() {
+      const pick = (doc) => {
+        try {
+          const list = $$('.questionLi', doc);
+          return list.length ? list : null;
+        } catch (e) { return null; }
+      };
+      const top = pick(document);
+      if (top) return top;
+      for (const f of $$('iframe')) {
+        try {
+          if (f.contentDocument) {
+            const list = pick(f.contentDocument);
+            if (list) return list;
+          }
+        } catch (e) { /* 跨域 iframe，跳过 */ }
+      }
+      return null;
+    },
+
+    _one(li, i) {
+      const tn = (li.getAttribute('typename') || '').replace(/\s/g, '');
+      const opts = $$('.answerBg', li);
+      const tas = $$('textarea[name^=answer], textarea[id^=answer]', li);
+      const h = li.querySelector('.mark_name') || li.querySelector('h3');
+      let title = '';
+      if (h) {
+        const c = h.cloneNode(true);
+        $$('.colorShallow', c).forEach((e) => e.remove()); // 去掉「(单选题)」那个灰 span
+        title = (c.innerText || c.textContent || '').replace(/\s+/g, ' ')
+          .replace(/^\s*\d+\s*[.、．]\s*/, '').trim();
+      }
+      const choices = opts.map((bg) => {
+        const num = bg.querySelector('.num_option');
+        const body = bg.querySelector('.answer_p');
+        return {
+          el: bg,
+          letter: ((num && (num.getAttribute('data') || num.textContent)) || '').trim().toUpperCase(),
+          t: ((body ? body.innerText : bg.innerText) || '').replace(/\s+/g, ' ').trim()
+        };
+      });
+      const isChoice = choices.length >= 2;
+      let type = CX_TYPES[tn];
+      if (!type) {
+        if (isChoice) {
+          type = (choices.length === 2 && /^(对|错|正确|错误|√|×)$/.test(choices[1].t))
+            ? 'judgement' : 'single_choice';
+        } else {
+          type = li.querySelector('.eidtDiv') ? 'short_answer' : 'fill_blank';
+        }
+      }
+      return {
+        n: i + 1,
+        kind: isChoice ? 'choice' : (type === 'fill_blank' ? 'fill' : 'essay'),
+        type: type,
+        multi: /多选题/.test(tn) || !!li.querySelector('input[type=checkbox]'),
+        title: title,
+        choices: choices,
+        _blanks: isChoice ? [] : tas,
+        _li: li
+      };
+    },
+
+    detect() {
+      // 结构优先：.questionLi 是学习通独有的容器类名，比死卡域名可靠
+      // （校内版、镜像站、本地备份的域名都可能不是 chaoxing.com）
+      const all = this._findList();
+      if (!all) {
+        if (/chaoxing\.com$/i.test(location.hostname)) {
+          this._why = '是超星域名但页面里没有 .questionLi（还没加载完，或这不是作业作答页）';
+        }
+        return false;
+      }
+      const usable = all.filter((li) =>
+        li.querySelector('.answerBg') || li.querySelector('textarea[name^=answer]'));
+      if (!usable.length) {
+        this._why = '有 .questionLi 但里面既没有选项也没有输入框';
+        return false;
+      }
+      this._lis = usable;
+      return true;
+    },
+
+    async collect() {
+      const all = this._findList() || this._lis || [];
+      this._lis = all.filter((li) =>
+        li.querySelector('.answerBg') || li.querySelector('textarea[name^=answer]'));
+      return this._lis.map((li, i) => this._one(li, i));
+    },
+
+    /** 先按字母精确挑（超星选项自带 data 字母），不行再退回文本 / 对错词匹配 */
+    _pick(q, ans) {
+      const raw = String(ans == null ? '' : ans).trim();
+      const up = raw.toUpperCase().replace(/[^A-J]/g, '');
+      if (up && !/[\u4e00-\u9fa5]/.test(raw)) {
+        const out = [];
+        up.split('').forEach((ch) => {
+          const hit = q.choices.filter((o) => o.letter === ch)[0];
+          if (hit) out.push(hit);
+        });
+        if (out.length) return out;
+      }
+      return resolveIdx(q.choices, raw).map((i) => q.choices[i]).filter(Boolean);
+    },
+
+    async apply(qs, map) {
+      let ok = 0; const miss = [];
+      for (const q of qs) {
+        const a = map[q.n];
+        if (!a) { miss.push(q.n); continue; }
+        if (q.kind === 'choice') {
+          const picks = this._pick(q, a);
+          if (!picks.length) { miss.push(q.n); continue; }
+          (q.multi ? picks : picks.slice(0, 1)).forEach((o) => {
+            if (!/check_answer/.test(o.el.className)) o.el.click();
+          });
+          ok++;
+        } else {
+          const tas = q._blanks || [];
+          if (!tas.length) { miss.push(q.n); continue; }
+          const parts = String(a).split('|');
+          const good = tas.filter((ta, i) =>
+            cxWrite(ta, (parts[i] != null ? parts[i] : parts[0] || '').trim()));
+          if (good.length) ok++; else miss.push(q.n);
+        }
+      }
+      if (ok) this._autosave();
+      return { ok: ok, miss: miss };
+    },
+
+    /** 学习通不点保存等于白填，填完顺手点一下「暂时保存」 */
+    _autosave() {
+      try {
+        const btn = $$('a,button,div,span').filter((e) =>
+          (e.innerText || '').trim() === '暂时保存' && e.offsetParent !== null)[0];
+        if (btn) {
+          btn.click();
+          log('💾 已点「暂时保存」，核对无误后自己点提交');
+        }
+      } catch (e) { /* 没有就算了 */ }
+    }
+  };
+  ADAPTERS.push(cxWorkAdapter);
+
+  /* ---------------------------------------------------------
+   * 4.4 通用启发式：没有专属 adapter 时兜底
    * -------------------------------------------------------*/
   const genericAdapter = {
     id: 'generic',
